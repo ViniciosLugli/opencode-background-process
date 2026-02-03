@@ -1,12 +1,24 @@
 {
   "name": "@howaboua/opencode-background-process",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "description": "OpenCode plugin for managing background processes - launch, monitor, and control long-running tasks",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "files": ["dist", "README.md", "LICENSE"],
-  "keywords": ["opencode", "opencode-plugin", "plugin", "background-process", "process-manager", "dev-server"],
+  "files": [
+    "dist",
+    "skills",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "plugin",
+    "background-process",
+    "process-manager",
+    "dev-server"
+  ],
   "license": "MIT",
   "publishConfig": {
     "access": "public"
@@ -22,7 +34,7 @@
   },
   "scripts": {
     "clean": "rm -rf dist",
-    "build": "npm run clean && tsc",
+    "build": "npm run clean && tsc && cp -r skills dist/",
     "dev": "opencode plugin dev",
     "prepublishOnly": "npm run build"
   }

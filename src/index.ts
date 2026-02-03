@@ -1,4 +1,6 @@
-import { type Plugin, tool } from "@opencode-ai/plugin"
+import { type Hooks, type Plugin, tool } from "@opencode-ai/plugin"
+
+import { createBundledSkillsHook } from "./skills"
 
 interface ProcessInfo {
   id: string
@@ -75,7 +77,13 @@ async function streamToOutput(stream: ReadableStream<Uint8Array> | null, info: P
 }
 
 export const BackgroundProcessPlugin: Plugin = async ({ directory }) => {
+  const skillsHook = createBundledSkillsHook()
+  const config: Hooks["config"] = async (value) => {
+    await skillsHook.config?.(value)
+  }
+
   return {
+    config,
     tool: {
       background_process_launch: tool({
         description: `Launch a command as a background process. The process runs independently and its output is captured for later reading. Useful for long-running tasks like dev servers, watchers, or build processes. Returns the process ID for future reference.`,
