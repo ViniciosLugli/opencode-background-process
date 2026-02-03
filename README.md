@@ -20,7 +20,7 @@ OpenCode automatically installs plugin dependencies at runtime.
 
 ### `background_process_launch`
 
-Start a command as a background process.
+Start a command as a background process. Use for long-running tasks instead of blocking shell runs.
 
 | Argument         | Type   | Required | Description                                |
 | ---------------- | ------ | -------- | ------------------------------------------ |
@@ -31,11 +31,11 @@ Start a command as a background process.
 
 ### `background_process_list`
 
-List all background processes with status, PID, runtime, and command.
+List background processes started by this tool in the current session (not system processes).
 
 ### `background_process_read`
 
-Read captured output from a background process.
+Read captured output from a background process started by this tool.
 
 | Argument | Type    | Required | Description                                 |
 | -------- | ------- | -------- | ------------------------------------------- |
@@ -45,7 +45,7 @@ Read captured output from a background process.
 
 ### `background_process_write`
 
-Send input to a running process's stdin.
+Send input to a running process started by this tool.
 
 | Argument  | Type    | Required | Description                    |
 | --------- | ------- | -------- | ------------------------------ |
@@ -55,7 +55,7 @@ Send input to a running process's stdin.
 
 ### `background_process_kill`
 
-Kill a background process.
+Kill a background process started by this tool.
 
 | Argument | Type    | Required | Description                                         |
 | -------- | ------- | -------- | --------------------------------------------------- |
@@ -65,7 +65,7 @@ Kill a background process.
 
 ### `background_process_cleanup`
 
-Remove exited processes or kill all processes.
+Remove exited processes or kill all tracked processes.
 
 | Argument  | Type    | Required | Description                                                      |
 | --------- | ------- | -------- | ---------------------------------------------------------------- |
@@ -87,7 +87,7 @@ Kill process 'bun-1'
 
 ## Notes
 
-- Processes are tracked per OpenCode session
+- Processes are tracked per OpenCode session and only include those started by this tool
 - Output is buffered (last 500 lines by default)
 - Auto-generated IDs use the command name (e.g., `bun-1`, `npm-2`)
 
