@@ -16,6 +16,10 @@ Add to your `opencode.json`:
 
 OpenCode automatically installs plugin dependencies at runtime.
 
+## Bundled Skill
+
+This plugin ships a bundled skill at `skills/background-process/SKILL.md` that provides housekeeping guidance for long-running processes and how to differentiate it from standard system processes. The plugin registers the skill automatically.
+
 ## Tools
 
 ### `background_process_launch`

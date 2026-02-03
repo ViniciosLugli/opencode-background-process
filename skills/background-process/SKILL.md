@@ -6,7 +6,7 @@ description: |-
   Examples:
   - user: "Start the dev server" → load skill, then launch with proper cleanup practices
   - user: "Run npm run dev" → load skill to verify startup and use meaningful IDs
-  - user: "Why won't my server start?" → check for duplicate processes, port conflicts
+  - user: "What background processes have we launched?" → check for duplicate processes, port conflicts
 ---
 
 # Background Process Best Practices
