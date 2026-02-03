@@ -86,7 +86,7 @@ export const BackgroundProcessPlugin: Plugin = async ({ directory }) => {
     config,
     tool: {
       background_process_launch: tool({
-        description: `Launch a command as a background process. The process runs independently and its output is captured for later reading. Useful for long-running tasks like dev servers, watchers, or build processes. Returns the process ID for future reference.`,
+        description: `Launch a command as a background process. For long-running tasks (dev servers, watchers, builds) you MUST use this tool instead of blocking shell runs. Only processes launched via this tool are tracked. Returns the process ID for future reference.`,
         args: {
           command: tool.schema.string().describe("The shell command to run in the background"),
           cwd: tool.schema
@@ -159,7 +159,7 @@ Use background_process_read to see output, or background_process_kill to stop it
 
       background_process_list: tool({
         description:
-          "List all background processes with their status, PID, runtime, and command. Shows both running and recently exited processes.",
+          "List background processes started by this tool in the current session (NOT system processes). You MUST NOT expect host process visibility. Shows running and recently exited processes with status, PID, runtime, and command.",
         args: {},
         async execute() {
           return formatProcessList()
@@ -168,7 +168,7 @@ Use background_process_read to see output, or background_process_kill to stop it
 
       background_process_read: tool({
         description:
-          "Read the captured output from a background process. Returns the most recent lines from the output buffer.",
+          "Read the captured output from a background process started by this tool. You SHOULD use this to verify long-running startup before assuming readiness. Returns the most recent lines from the output buffer.",
         args: {
           id: tool.schema.string().describe("The process ID to read output from"),
           lines: tool.schema.number().optional().default(50).describe("Number of recent lines to return (default: 50)"),
@@ -199,7 +199,7 @@ Use background_process_read to see output, or background_process_kill to stop it
 
       background_process_write: tool({
         description:
-          "Send input to a running background process's stdin. Useful for interactive processes that accept commands.",
+          "Send input to a running background process started by this tool. You MUST NOT use this for system processes. Useful for interactive processes that accept commands.",
         args: {
           id: tool.schema.string().describe("The process ID to send input to"),
           input: tool.schema.string().describe("The input to send to the process stdin"),
@@ -232,7 +232,7 @@ Use background_process_read to see output, or background_process_kill to stop it
 
       background_process_kill: tool({
         description:
-          "Kill a background process. Sends SIGTERM by default, or SIGKILL for force kill. Optionally removes the process from tracking.",
+          "Kill a background process started by this tool. You MUST NOT use this to target system processes. Sends SIGTERM by default, or SIGKILL for force kill. Optionally removes the process from tracking.",
         args: {
           id: tool.schema.string().describe("The process ID to kill"),
           signal: tool.schema
@@ -280,7 +280,7 @@ Use background_process_read to see output, or background_process_kill to stop it
 
       background_process_cleanup: tool({
         description:
-          "Remove all exited processes from tracking, or kill all processes and clean up. Useful for housekeeping.",
+          "Remove all exited processes from tracking, or kill all tracked processes and clean up. Only affects processes started by this tool; you MUST NOT expect system cleanup.",
         args: {
           killAll: tool.schema
             .boolean()
