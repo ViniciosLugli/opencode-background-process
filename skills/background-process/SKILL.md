@@ -1,12 +1,12 @@
 ---
 name: background-process
 description: |-
-  Housekeeping guide for background process tools. You SHOULD load this skill before launching background processes to avoid stale processes, port conflicts, and buffer issues.
+  Launch, monitor, and clean up background processes such as dev servers and build watchers. Covers startup verification, port conflict resolution, signal handling, and stale process cleanup. Use when you need to start a server, run a process in the background, fix "port already in use" errors, or kill a running process.
 
   Examples:
   - user: "Start the dev server" → load skill, then launch with proper cleanup practices
   - user: "Run npm run dev" → load skill to verify startup and use meaningful IDs
-  - user: "What background processes have we launched?" → check for duplicate processes, port conflicts
+  - user: "Port 3000 is already in use" → find and kill the stale process, then relaunch
 ---
 
 # Background Process Best Practices
@@ -28,7 +28,15 @@ After launching, wait before reading output - servers need time to start:
 3. `background_process_read` to confirm startup
 4. If output is empty or incomplete, wait longer and re-read
 
-Look for: "listening on", "ready", "started" - or errors like port conflicts
+Look for: "listening on", "ready", "started" - or errors like port conflicts.
+If the process fails to start after 60s, read stderr, fix the issue, kill the process, and relaunch.
+
+## Port Conflict Resolution
+
+1. `lsof -i :<port>` to identify the process holding the port
+2. `background_process_kill` with its ID (or `kill <PID>` for external processes)
+3. Verify port is free: `lsof -i :<port>` returns empty
+4. Relaunch the server
 
 ## Use Meaningful IDs
 
