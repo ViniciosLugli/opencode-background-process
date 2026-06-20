@@ -1,11 +1,12 @@
 ---
 name: background-process
 description: |-
-  Launch, monitor, and clean up background processes such as dev servers and build watchers. Covers startup verification, port conflict resolution, signal handling, and stale process cleanup. Use when you need to start a server, run a process in the background, fix "port already in use" errors, or kill a running process.
+  Launch, wait for, monitor, and clean up background processes such as finite commands, dev servers, and build watchers. Covers completion waiting, startup verification, port conflict resolution, signal handling, and stale process cleanup. Use when you need to start a server, run a process in the background, wait for completion, fix "port already in use" errors, or kill a running process.
 
   Examples:
   - user: "Start the dev server" → load skill, then launch with proper cleanup practices
-  - user: "Run npm run dev" → load skill to verify startup and use meaningful IDs
+  - user: "Run bun run dev" → load skill to verify startup and use meaningful IDs
+  - user: "Run the build in the background and wait for it" → launch, then wait with a bounded timeout
   - user: "Port 3000 is already in use" → find and kill the stale process, then relaunch
 ---
 
@@ -22,7 +23,7 @@ description: |-
 
 ## Verify Startup
 
-After launching, wait before reading output - servers need time to start:
+For servers and watchers, wait before reading output - they need time to start:
 1. Launch the process
 2. Sleep at least 30 seconds (use bash `sleep` or just wait before next action)
 3. `background_process_read` to confirm startup
@@ -30,6 +31,36 @@ After launching, wait before reading output - servers need time to start:
 
 Look for: "listening on", "ready", "started" - or errors like port conflicts.
 If the process fails to start after 60s, read stderr, fix the issue, kill the process, and relaunch.
+
+## Wait For Finite Processes
+
+Use `background_process_wait` for commands that should eventually terminate, such as builds, tests, migrations, and scripts.
+
+- Default timeout is 5 minutes
+- Maximum timeout is 10 minutes
+- Timeout does not kill the process
+- Tool status metadata is updated every 2 minutes while waiting
+- Heartbeat entries are also recorded in process output and returned with the final result
+- If a process times out, inspect recent output before deciding whether to wait again or kill it explicitly
+
+Do not use `background_process_wait` for dev servers, file watchers, or processes expected to run indefinitely.
+
+## Diagnose Timeout Causes
+
+When a wait times out, aggregate the likely causes from recent output before acting:
+
+- still making progress: wait again with an appropriate timeout
+- blocked on input: use `background_process_write` if the process is interactive
+- failed but not exited: read output, then kill if it is unrecoverable
+- wrong process type: switch to readiness checks for servers and watchers
+
+## Respect Tracking Boundaries
+
+Only processes started by `background_process_launch` are tracked.
+
+- Do not assume this tool can walk the host process tree
+- Do not use tracked IDs as system PIDs
+- For external port conflicts, inspect with shell tools first, then kill external PIDs explicitly
 
 ## Port Conflict Resolution
 

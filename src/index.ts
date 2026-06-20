@@ -1,4 +1,4 @@
-import { type Hooks, type Plugin, tool } from "@opencode-ai/plugin"
+import { type Hooks, type Plugin, type ToolContext, tool } from "@opencode-ai/plugin"
 
 import { createBundledSkillsHook } from "./skills"
 
@@ -6,6 +6,8 @@ interface ProcessInfo {
   id: string
   command: string
   proc: ReturnType<typeof Bun.spawn>
+  exitPromise: Promise<number>
+  outputPromise: Promise<void>
   output: string[]
   maxOutputLines: number
   startedAt: Date
@@ -15,6 +17,10 @@ interface ProcessInfo {
 }
 
 const processes = new Map<string, ProcessInfo>()
+
+const DEFAULT_WAIT_TIMEOUT_SECONDS = 5 * 60
+const MAX_WAIT_TIMEOUT_SECONDS = 10 * 60
+const HEARTBEAT_INTERVAL_SECONDS = 2 * 60
 
 let processCounter = 0
 
@@ -42,6 +48,70 @@ function getProcessStatus(info: ProcessInfo): string {
   return "running"
 }
 
+function getRuntimeSeconds(info: ProcessInfo): number {
+  return Math.round((Date.now() - info.startedAt.getTime()) / 1000)
+}
+
+function formatDuration(totalSeconds: number): string {
+  const seconds = Math.max(0, Math.round(totalSeconds))
+  const minutes = Math.floor(seconds / 60)
+  const remainingSeconds = seconds % 60
+  if (minutes === 0) return `${remainingSeconds}s`
+  if (remainingSeconds === 0) return `${minutes}m`
+  return `${minutes}m ${remainingSeconds}s`
+}
+
+function formatProcessSummary(info: ProcessInfo): string[] {
+  return [
+    `ID: ${info.id}`,
+    `PID: ${info.proc.pid}`,
+    `Status: ${getProcessStatus(info)}`,
+    `Runtime: ${formatDuration(getRuntimeSeconds(info))}`,
+    `Command: ${info.command}`,
+    `CWD: ${info.cwd}`,
+  ]
+}
+
+function formatRecentOutput(info: ProcessInfo, lines: number): string {
+  const output = info.output.slice(-lines)
+  if (output.length === 0) return "No output captured."
+  return output.join("\n")
+}
+
+function updateWaitMetadata(
+  context: ToolContext,
+  info: ProcessInfo,
+  title: string,
+  extra: Record<string, unknown> = {},
+) {
+  context.metadata({
+    title,
+    metadata: {
+      id: info.id,
+      pid: info.proc.pid,
+      command: info.command,
+      cwd: info.cwd,
+      status: getProcessStatus(info),
+      runtimeSeconds: getRuntimeSeconds(info),
+      ...extra,
+    },
+  })
+}
+
+function normalizeWaitTimeout(timeoutSeconds: number): number {
+  if (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 1 || timeoutSeconds > MAX_WAIT_TIMEOUT_SECONDS) {
+    throw new Error(`timeoutSeconds must be between 1 and ${MAX_WAIT_TIMEOUT_SECONDS}.`)
+  }
+  return Math.round(timeoutSeconds)
+}
+
+function normalizeOutputLines(lines: number): number {
+  if (!Number.isFinite(lines) || lines < 1) {
+    throw new Error("lines must be greater than 0.")
+  }
+  return Math.round(lines)
+}
+
 function formatProcessList(): string {
   if (processes.size === 0) {
     return "No background processes running."
@@ -50,9 +120,8 @@ function formatProcessList(): string {
   const lines: string[] = ["Background Processes:", ""]
   for (const [id, info] of processes) {
     const status = getProcessStatus(info)
-    const runtime = Math.round((Date.now() - info.startedAt.getTime()) / 1000)
     const pid = info.proc.pid
-    lines.push(`[${id}] PID: ${pid} | Status: ${status} | Runtime: ${runtime}s`)
+    lines.push(`[${id}] PID: ${pid} | Status: ${status} | Runtime: ${formatDuration(getRuntimeSeconds(info))}`)
     lines.push(`    Command: ${info.command}`)
     lines.push(`    CWD: ${info.cwd}`)
     lines.push("")
@@ -74,6 +143,73 @@ async function streamToOutput(stream: ReadableStream<Uint8Array> | null, info: P
   } catch {
     // Stream closed
   }
+}
+
+function waitForNextEvent(
+  info: ProcessInfo,
+  seconds: number,
+  abort: AbortSignal,
+): Promise<number | "heartbeat" | "aborted"> {
+  if (info.exited) return Promise.resolve(info.exitCode ?? 0)
+  if (abort.aborted) return Promise.resolve("aborted")
+
+  return new Promise((resolve) => {
+    let settled = false
+    let timeout: ReturnType<typeof setTimeout>
+    function settle(value: number | "heartbeat" | "aborted") {
+      if (settled) return
+      settled = true
+      clearTimeout(timeout)
+      abort.removeEventListener("abort", onAbort)
+      resolve(value)
+    }
+    const onAbort = () => settle("aborted")
+
+    timeout = setTimeout(() => settle("heartbeat"), seconds * 1000)
+    abort.addEventListener("abort", onAbort, { once: true })
+    info.exitPromise.then((code) => settle(code))
+  })
+}
+
+async function waitForProcessExit(
+  info: ProcessInfo,
+  timeoutSeconds: number,
+  abort: AbortSignal,
+  onHeartbeat: (heartbeat: string, remainingSeconds: number) => void,
+): Promise<{ result: "exited" | "timeout" | "aborted"; heartbeats: string[] }> {
+  const startedAt = Date.now()
+  const deadline = startedAt + timeoutSeconds * 1000
+  const heartbeats: string[] = []
+  let nextHeartbeatAt = startedAt + HEARTBEAT_INTERVAL_SECONDS * 1000
+
+  while (!info.exited) {
+    const now = Date.now()
+    const secondsUntilTimeout = Math.max(0, Math.ceil((deadline - now) / 1000))
+    if (secondsUntilTimeout === 0) return { result: "timeout", heartbeats }
+
+    const secondsUntilHeartbeat = Math.max(1, Math.ceil((nextHeartbeatAt - now) / 1000))
+    const waitSeconds = Math.min(secondsUntilTimeout, secondsUntilHeartbeat)
+
+    const result = await waitForNextEvent(info, waitSeconds, abort)
+
+    if (typeof result === "number") {
+      await info.outputPromise
+      return { result: "exited", heartbeats }
+    }
+    if (result === "aborted") return { result: "aborted", heartbeats }
+
+    if (Date.now() >= nextHeartbeatAt && !info.exited) {
+      const remainingSeconds = Math.max(0, Math.ceil((deadline - Date.now()) / 1000))
+      const heartbeat = `[wait] Process "${info.id}" still running after ${formatDuration(getRuntimeSeconds(info))}. Timeout in ${formatDuration(remainingSeconds)}.`
+      heartbeats.push(heartbeat)
+      appendOutput(info, heartbeat)
+      onHeartbeat(heartbeat, remainingSeconds)
+      nextHeartbeatAt += HEARTBEAT_INTERVAL_SECONDS * 1000
+    }
+  }
+
+  await info.outputPromise
+  return { result: "exited", heartbeats }
 }
 
 export const BackgroundProcessPlugin: Plugin = async ({ directory }) => {
@@ -115,10 +251,20 @@ export const BackgroundProcessPlugin: Plugin = async ({ directory }) => {
             stderr: "pipe",
           })
 
-          const info: ProcessInfo = {
+          let info: ProcessInfo
+          const exitPromise = proc.exited.then((code) => {
+            info.exited = true
+            info.exitCode = code
+            appendOutput(info, `[exit] Process exited with code ${code}`)
+            return code
+          })
+
+          info = {
             id,
             command: args.command,
             proc,
+            exitPromise,
+            outputPromise: Promise.resolve(),
             output: [],
             maxOutputLines: args.maxOutputLines,
             startedAt: new Date(),
@@ -127,16 +273,10 @@ export const BackgroundProcessPlugin: Plugin = async ({ directory }) => {
             exitCode: null,
           }
 
-          // Start streaming stdout and stderr in background
-          streamToOutput(proc.stdout, info)
-          streamToOutput(proc.stderr, info, "[stderr] ")
-
-          // Track exit
-          proc.exited.then((code) => {
-            info.exited = true
-            info.exitCode = code
-            appendOutput(info, `[exit] Process exited with code ${code}`)
-          })
+          info.outputPromise = Promise.all([
+            streamToOutput(proc.stdout, info),
+            streamToOutput(proc.stderr, info, "[stderr] "),
+          ]).then(() => undefined)
 
           processes.set(id, info)
 
@@ -144,6 +284,7 @@ export const BackgroundProcessPlugin: Plugin = async ({ directory }) => {
           await Bun.sleep(100)
 
           if (info.exited) {
+            await info.outputPromise
             return `Process "${id}" started but exited immediately with code ${info.exitCode}.\nOutput:\n${info.output.join("\n")}`
           }
 
@@ -194,6 +335,119 @@ Use background_process_read to see output, or background_process_kill to stop it
 
           const header = `Process "${args.id}" (${status}) - Last ${output.length} lines:`
           return `${header}\n${"─".repeat(50)}\n${output.join("\n")}`
+        },
+      }),
+
+      background_process_wait: tool({
+        description:
+          "Wait for a tracked background process to finish. Use for finite commands that were launched in the background. The wait is bounded, supports aborts, records heartbeat entries every 2 minutes while waiting, and never kills the process on timeout.",
+        args: {
+          id: tool.schema.string().describe("The process ID to wait for"),
+          timeoutSeconds: tool.schema
+            .number()
+            .int()
+            .min(1)
+            .max(MAX_WAIT_TIMEOUT_SECONDS)
+            .optional()
+            .default(DEFAULT_WAIT_TIMEOUT_SECONDS)
+            .describe("Maximum seconds to wait, from 1 to 600 (default: 300)"),
+          lines: tool.schema
+            .number()
+            .int()
+            .min(1)
+            .max(5000)
+            .optional()
+            .default(50)
+            .describe("Number of recent output lines to include in the result (default: 50)"),
+        },
+        async execute(args, context) {
+          const info = processes.get(args.id)
+          if (!info) {
+            const available = Array.from(processes.keys())
+            return `Error: No process found with ID "${args.id}". Available processes: ${available.length ? available.join(", ") : "none"}`
+          }
+
+          let timeoutSeconds: number
+          let lines: number
+          try {
+            timeoutSeconds = normalizeWaitTimeout(args.timeoutSeconds)
+            lines = normalizeOutputLines(args.lines)
+          } catch (error) {
+            return `Error: ${error instanceof Error ? error.message : String(error)}`
+          }
+
+          updateWaitMetadata(context, info, `Waiting for ${info.id}`, {
+            timeoutSeconds,
+            remainingSeconds: timeoutSeconds,
+            heartbeatIntervalSeconds: HEARTBEAT_INTERVAL_SECONDS,
+          })
+
+          const wait = await waitForProcessExit(info, timeoutSeconds, context.abort, (heartbeat, remainingSeconds) => {
+            updateWaitMetadata(context, info, `Still waiting for ${info.id}`, {
+              heartbeat,
+              remainingSeconds,
+              timeoutSeconds,
+              heartbeatIntervalSeconds: HEARTBEAT_INTERVAL_SECONDS,
+            })
+          })
+          const summary = formatProcessSummary(info)
+          const heartbeatLines =
+            wait.heartbeats.length > 0 ? wait.heartbeats.map((line) => `- ${line}`) : ["No heartbeat was needed."]
+          const output = formatRecentOutput(info, lines)
+
+          if (wait.result === "timeout") {
+            updateWaitMetadata(context, info, `Wait timed out for ${info.id}`, {
+              result: wait.result,
+              timeoutSeconds,
+            })
+            return [
+              `Timed out waiting for process "${info.id}" after ${formatDuration(timeoutSeconds)}. The process is still tracked and was not killed.`,
+              "",
+              ...summary,
+              "",
+              "Heartbeats:",
+              ...heartbeatLines,
+              "",
+              `Recent output (${lines} line limit):`,
+              output,
+            ].join("\n")
+          }
+
+          if (wait.result === "aborted") {
+            updateWaitMetadata(context, info, `Wait aborted for ${info.id}`, {
+              result: wait.result,
+              timeoutSeconds,
+            })
+            return [
+              `Stopped waiting for process "${info.id}" because the tool call was aborted. The process was not killed.`,
+              "",
+              ...summary,
+              "",
+              "Heartbeats:",
+              ...heartbeatLines,
+              "",
+              `Recent output (${lines} line limit):`,
+              output,
+            ].join("\n")
+          }
+
+          updateWaitMetadata(context, info, `Finished ${info.id}`, {
+            result: wait.result,
+            exitCode: info.exitCode,
+            timeoutSeconds,
+          })
+
+          return [
+            `Process "${info.id}" finished.`,
+            "",
+            ...summary,
+            "",
+            "Heartbeats:",
+            ...heartbeatLines,
+            "",
+            `Recent output (${lines} line limit):`,
+            output,
+          ].join("\n")
         },
       }),
 
