@@ -14,17 +14,17 @@ An OpenCode plugin for managing background processes. Launch, monitor, and contr
 
 ## Installation
 
-Add the package to your OpenCode plugins:
+OpenCode 1.17.8 does not reliably load GitHub package specs directly from the `plugin` directive. Use a local file URL that points at the built plugin:
 
 ```json
 {
   "plugin": [
-    "@vinicioslugli/opencode-background-process@git+https://github.com/ViniciosLugli/opencode-background-process.git"
+    "file:///home/server/tools/opencode-background-process/dist/index.js"
   ]
 }
 ```
 
-OpenCode automatically installs plugin dependencies at runtime. This package is intended to be installed through OpenCode's plugin directive from the repository URL, without manually cloning the repository.
+This repository remains GitHub-only and is not published to npm. To use it on another machine, clone the GitHub repository, build it with Bun, then point OpenCode at that machine's built `dist/index.js`.
 
 For local development, use Bun:
 

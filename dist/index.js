@@ -4,6 +4,9 @@ const processes = new Map();
 const DEFAULT_WAIT_TIMEOUT_SECONDS = 5 * 60;
 const MAX_WAIT_TIMEOUT_SECONDS = 10 * 60;
 const HEARTBEAT_INTERVAL_SECONDS = 2 * 60;
+const DEFAULT_OUTPUT_LINES = 50;
+const DEFAULT_MAX_OUTPUT_LINES = 500;
+const MAX_OUTPUT_LINES = 5000;
 let processCounter = 0;
 function generateId(command) {
     const shortCmd = command.split(" ")[0].split("/").pop() || "proc";
@@ -70,16 +73,18 @@ function updateWaitMetadata(context, info, title, extra = {}) {
     });
 }
 function normalizeWaitTimeout(timeoutSeconds) {
-    if (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 1 || timeoutSeconds > MAX_WAIT_TIMEOUT_SECONDS) {
+    const value = timeoutSeconds ?? DEFAULT_WAIT_TIMEOUT_SECONDS;
+    if (!Number.isFinite(value) || value < 1 || value > MAX_WAIT_TIMEOUT_SECONDS) {
         throw new Error(`timeoutSeconds must be between 1 and ${MAX_WAIT_TIMEOUT_SECONDS}.`);
     }
-    return Math.round(timeoutSeconds);
+    return Math.round(value);
 }
-function normalizeOutputLines(lines) {
-    if (!Number.isFinite(lines) || lines < 1) {
-        throw new Error("lines must be greater than 0.");
+function normalizeOutputLines(lines, defaultLines = DEFAULT_OUTPUT_LINES) {
+    const value = lines ?? defaultLines;
+    if (!Number.isFinite(value) || value < 1 || value > MAX_OUTPUT_LINES) {
+        throw new Error(`lines must be between 1 and ${MAX_OUTPUT_LINES}.`);
     }
-    return Math.round(lines);
+    return Math.round(value);
 }
 function formatProcessList() {
     if (processes.size === 0) {
@@ -186,8 +191,11 @@ export const BackgroundProcessPlugin = async ({ directory }) => {
                     id: tool.schema.string().optional().describe("Custom ID for this process (auto-generated if not provided)"),
                     maxOutputLines: tool.schema
                         .number()
+                        .int()
+                        .min(1)
+                        .max(MAX_OUTPUT_LINES)
                         .optional()
-                        .default(500)
+                        .default(DEFAULT_MAX_OUTPUT_LINES)
                         .describe("Maximum output lines to keep in buffer (default: 500)"),
                 },
                 async execute(args) {
@@ -195,6 +203,13 @@ export const BackgroundProcessPlugin = async ({ directory }) => {
                     const id = args.id || generateId(args.command);
                     if (processes.has(id)) {
                         return `Error: Process with ID "${id}" already exists. Use a different ID or kill the existing process first.`;
+                    }
+                    let maxOutputLines;
+                    try {
+                        maxOutputLines = normalizeOutputLines(args.maxOutputLines, DEFAULT_MAX_OUTPUT_LINES);
+                    }
+                    catch (error) {
+                        return `Error: ${error instanceof Error ? error.message : String(error)}`;
                     }
                     const proc = Bun.spawn(["sh", "-c", args.command], {
                         cwd,
@@ -216,7 +231,7 @@ export const BackgroundProcessPlugin = async ({ directory }) => {
                         exitPromise,
                         outputPromise: Promise.resolve(),
                         output: [],
-                        maxOutputLines: args.maxOutputLines,
+                        maxOutputLines,
                         startedAt: new Date(),
                         cwd,
                         exited: false,
@@ -253,7 +268,14 @@ Use background_process_read to see output, or background_process_kill to stop it
                 description: "Read the captured output from a background process started by this tool. You SHOULD use this to verify long-running startup before assuming readiness. Returns the most recent lines from the output buffer.",
                 args: {
                     id: tool.schema.string().describe("The process ID to read output from"),
-                    lines: tool.schema.number().optional().default(50).describe("Number of recent lines to return (default: 50)"),
+                    lines: tool.schema
+                        .number()
+                        .int()
+                        .min(1)
+                        .max(MAX_OUTPUT_LINES)
+                        .optional()
+                        .default(DEFAULT_OUTPUT_LINES)
+                        .describe("Number of recent lines to return (default: 50)"),
                     clear: tool.schema.boolean().optional().default(false).describe("Clear the output buffer after reading"),
                 },
                 async execute(args) {
@@ -263,7 +285,14 @@ Use background_process_read to see output, or background_process_kill to stop it
                         return `Error: No process found with ID "${args.id}". Available processes: ${available.length ? available.join(", ") : "none"}`;
                     }
                     const status = getProcessStatus(info);
-                    const output = info.output.slice(-args.lines);
+                    let lines;
+                    try {
+                        lines = normalizeOutputLines(args.lines);
+                    }
+                    catch (error) {
+                        return `Error: ${error instanceof Error ? error.message : String(error)}`;
+                    }
+                    const output = info.output.slice(-lines);
                     if (args.clear) {
                         info.output = [];
                     }
@@ -290,9 +319,9 @@ Use background_process_read to see output, or background_process_kill to stop it
                         .number()
                         .int()
                         .min(1)
-                        .max(5000)
+                        .max(MAX_OUTPUT_LINES)
                         .optional()
-                        .default(50)
+                        .default(DEFAULT_OUTPUT_LINES)
                         .describe("Number of recent output lines to include in the result (default: 50)"),
                 },
                 async execute(args, context) {
@@ -397,7 +426,8 @@ Use background_process_read to see output, or background_process_kill to stop it
                     if (info.exited) {
                         return `Error: Process "${args.id}" has already exited.`;
                     }
-                    const data = args.newline ? `${args.input}\n` : args.input;
+                    const newline = args.newline ?? true;
+                    const data = newline ? `${args.input}\n` : args.input;
                     const stdin = info.proc.stdin;
                     if (!stdin || typeof stdin === "number") {
                         return `Error: Process "${args.id}" stdin is not available.`;
@@ -428,22 +458,24 @@ Use background_process_read to see output, or background_process_kill to stop it
                     }
                     const status = getProcessStatus(info);
                     if (info.exited) {
-                        if (args.remove) {
+                        if (args.remove ?? false) {
                             processes.delete(args.id);
                             return `Process "${args.id}" already exited (${status}). Removed from tracking.`;
                         }
                         return `Process "${args.id}" already exited (${status}). Use remove=true to clear it.`;
                     }
-                    const signalNum = args.signal === "SIGKILL" ? 9 : args.signal === "SIGINT" ? 2 : 15;
+                    const signal = args.signal ?? "SIGTERM";
+                    const remove = args.remove ?? false;
+                    const signalNum = signal === "SIGKILL" ? 9 : signal === "SIGINT" ? 2 : 15;
                     info.proc.kill(signalNum);
                     // Wait for process to exit
                     await Bun.sleep(200);
                     const newStatus = getProcessStatus(info);
-                    if (args.remove) {
+                    if (remove) {
                         processes.delete(args.id);
-                        return `Process "${args.id}" killed with ${args.signal} (${newStatus}). Removed from tracking.`;
+                        return `Process "${args.id}" killed with ${signal} (${newStatus}). Removed from tracking.`;
                     }
-                    return `Process "${args.id}" killed with ${args.signal} (${newStatus}).`;
+                    return `Process "${args.id}" killed with ${signal} (${newStatus}).`;
                 },
             }),
             background_process_cleanup: tool({
@@ -463,7 +495,7 @@ Use background_process_read to see output, or background_process_kill to stop it
                             processes.delete(id);
                             removed.push(id);
                         }
-                        else if (args.killAll) {
+                        else if (args.killAll ?? false) {
                             info.proc.kill(15); // SIGTERM
                             killed.push(id);
                             processes.delete(id);

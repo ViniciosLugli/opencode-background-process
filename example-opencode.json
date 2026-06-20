@@ -1,6 +1,6 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    "@vinicioslugli/opencode-background-process@git+https://github.com/ViniciosLugli/opencode-background-process.git"
+    "file:///home/server/tools/opencode-background-process/dist/index.js"
   ]
 }
