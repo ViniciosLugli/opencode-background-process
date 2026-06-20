@@ -7,6 +7,10 @@ const HEARTBEAT_INTERVAL_SECONDS = 2 * 60;
 const DEFAULT_OUTPUT_LINES = 50;
 const DEFAULT_MAX_OUTPUT_LINES = 500;
 const MAX_OUTPUT_LINES = 5000;
+const KILL_WAIT_MS = 2_000;
+const CLEANUP_TERM_WAIT_MS = 2_000;
+const CLEANUP_KILL_WAIT_MS = 2_000;
+const OUTPUT_DRAIN_WAIT_MS = 1_000;
 let processCounter = 0;
 function generateId(command) {
     const shortCmd = command.split(" ")[0].split("/").pop() || "proc";
@@ -25,6 +29,9 @@ function appendOutput(info, data) {
 }
 function getProcessStatus(info) {
     if (info.exited) {
+        if (isProcessGroupAlive(info)) {
+            return `exited (code ${info.exitCode}, process group still running)`;
+        }
         return `exited (code ${info.exitCode})`;
     }
     return "running";
@@ -86,6 +93,54 @@ function normalizeOutputLines(lines, defaultLines = DEFAULT_OUTPUT_LINES) {
     }
     return Math.round(value);
 }
+function signalToNumber(signal) {
+    if (signal === "SIGKILL")
+        return 9;
+    if (signal === "SIGINT")
+        return 2;
+    return 15;
+}
+function signalProcessGroup(info, signal) {
+    try {
+        process.kill(-info.proc.pid, signal);
+        return { ok: true };
+    }
+    catch (groupError) {
+        try {
+            info.proc.kill(signalToNumber(signal));
+            return { ok: true };
+        }
+        catch (processError) {
+            return { ok: false, error: processError instanceof Error ? processError : groupError };
+        }
+    }
+}
+function isProcessGroupAlive(info) {
+    try {
+        process.kill(-info.proc.pid, 0);
+        return true;
+    }
+    catch (error) {
+        if (error instanceof Error && "code" in error && error.code === "ESRCH")
+            return false;
+        return true;
+    }
+}
+function isProcessTerminated(info) {
+    return info.exited && !isProcessGroupAlive(info);
+}
+async function waitForTrackedTermination(info, timeoutMs) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        if (isProcessTerminated(info))
+            return true;
+        await Bun.sleep(50);
+    }
+    return isProcessTerminated(info);
+}
+async function waitForOutputDrain(info) {
+    await Promise.race([info.outputPromise, Bun.sleep(OUTPUT_DRAIN_WAIT_MS)]);
+}
 function formatProcessList() {
     if (processes.size === 0) {
         return "No background processes running.";
@@ -120,7 +175,7 @@ async function streamToOutput(stream, info, prefix = "") {
     }
 }
 function waitForNextEvent(info, seconds, abort) {
-    if (info.exited)
+    if (isProcessTerminated(info))
         return Promise.resolve(info.exitCode ?? 0);
     if (abort.aborted)
         return Promise.resolve("aborted");
@@ -136,9 +191,11 @@ function waitForNextEvent(info, seconds, abort) {
             resolve(value);
         }
         const onAbort = () => settle("aborted");
-        timeout = setTimeout(() => settle("heartbeat"), seconds * 1000);
+        const waitSeconds = info.exited ? Math.min(seconds, 1) : seconds;
+        timeout = setTimeout(() => settle("heartbeat"), waitSeconds * 1000);
         abort.addEventListener("abort", onAbort, { once: true });
-        info.exitPromise.then((code) => settle(code));
+        if (!info.exited)
+            info.exitPromise.then((code) => settle(code));
     });
 }
 async function waitForProcessExit(info, timeoutSeconds, abort, onHeartbeat) {
@@ -146,7 +203,7 @@ async function waitForProcessExit(info, timeoutSeconds, abort, onHeartbeat) {
     const deadline = startedAt + timeoutSeconds * 1000;
     const heartbeats = [];
     let nextHeartbeatAt = startedAt + HEARTBEAT_INTERVAL_SECONDS * 1000;
-    while (!info.exited) {
+    while (!isProcessTerminated(info)) {
         const now = Date.now();
         const secondsUntilTimeout = Math.max(0, Math.ceil((deadline - now) / 1000));
         if (secondsUntilTimeout === 0)
@@ -155,12 +212,15 @@ async function waitForProcessExit(info, timeoutSeconds, abort, onHeartbeat) {
         const waitSeconds = Math.min(secondsUntilTimeout, secondsUntilHeartbeat);
         const result = await waitForNextEvent(info, waitSeconds, abort);
         if (typeof result === "number") {
-            await info.outputPromise;
-            return { result: "exited", heartbeats };
+            if (isProcessTerminated(info)) {
+                await waitForOutputDrain(info);
+                return { result: "exited", heartbeats };
+            }
+            continue;
         }
         if (result === "aborted")
             return { result: "aborted", heartbeats };
-        if (Date.now() >= nextHeartbeatAt && !info.exited) {
+        if (Date.now() >= nextHeartbeatAt && !isProcessTerminated(info)) {
             const remainingSeconds = Math.max(0, Math.ceil((deadline - Date.now()) / 1000));
             const heartbeat = `[wait] Process "${info.id}" still running after ${formatDuration(getRuntimeSeconds(info))}. Timeout in ${formatDuration(remainingSeconds)}.`;
             heartbeats.push(heartbeat);
@@ -169,7 +229,7 @@ async function waitForProcessExit(info, timeoutSeconds, abort, onHeartbeat) {
             nextHeartbeatAt += HEARTBEAT_INTERVAL_SECONDS * 1000;
         }
     }
-    await info.outputPromise;
+    await waitForOutputDrain(info);
     return { result: "exited", heartbeats };
 }
 export const BackgroundProcessPlugin = async ({ directory }) => {
@@ -213,6 +273,7 @@ export const BackgroundProcessPlugin = async ({ directory }) => {
                     }
                     const proc = Bun.spawn(["sh", "-c", args.command], {
                         cwd,
+                        detached: true,
                         stdin: "pipe",
                         stdout: "pipe",
                         stderr: "pipe",
@@ -437,7 +498,7 @@ Use background_process_read to see output, or background_process_kill to stop it
                 },
             }),
             background_process_kill: tool({
-                description: "Kill a background process started by this tool. You MUST NOT use this to target system processes. Sends SIGTERM by default, or SIGKILL for force kill. Optionally removes the process from tracking.",
+                description: "Terminate a background process started by this tool. Sends signals to the launched process group, waits for confirmed termination, and only removes it from tracking after it is stopped. You MUST NOT use this to target system processes.",
                 args: {
                     id: tool.schema.string().describe("The process ID to kill"),
                     signal: tool.schema
@@ -457,7 +518,7 @@ Use background_process_read to see output, or background_process_kill to stop it
                         return `Error: No process found with ID "${args.id}".`;
                     }
                     const status = getProcessStatus(info);
-                    if (info.exited) {
+                    if (isProcessTerminated(info)) {
                         if (args.remove ?? false) {
                             processes.delete(args.id);
                             return `Process "${args.id}" already exited (${status}). Removed from tracking.`;
@@ -466,20 +527,25 @@ Use background_process_read to see output, or background_process_kill to stop it
                     }
                     const signal = args.signal ?? "SIGTERM";
                     const remove = args.remove ?? false;
-                    const signalNum = signal === "SIGKILL" ? 9 : signal === "SIGINT" ? 2 : 15;
-                    info.proc.kill(signalNum);
-                    // Wait for process to exit
-                    await Bun.sleep(200);
+                    const sent = signalProcessGroup(info, signal);
+                    if (!sent.ok) {
+                        return `Error: Failed to send ${signal} to process "${args.id}": ${sent.error instanceof Error ? sent.error.message : String(sent.error)}`;
+                    }
+                    const exited = await waitForTrackedTermination(info, KILL_WAIT_MS);
                     const newStatus = getProcessStatus(info);
+                    if (!exited) {
+                        return `Signal ${signal} was sent to process "${args.id}", but it is still running (${newStatus}). It was not removed. Use signal=SIGKILL if it does not stop gracefully.`;
+                    }
+                    await waitForOutputDrain(info);
                     if (remove) {
                         processes.delete(args.id);
-                        return `Process "${args.id}" killed with ${signal} (${newStatus}). Removed from tracking.`;
+                        return `Process "${args.id}" terminated with ${signal} (${newStatus}). Removed from tracking.`;
                     }
-                    return `Process "${args.id}" killed with ${signal} (${newStatus}).`;
+                    return `Process "${args.id}" terminated with ${signal} (${newStatus}).`;
                 },
             }),
             background_process_cleanup: tool({
-                description: "Remove all exited processes from tracking, or kill all tracked processes and clean up. Only affects processes started by this tool; you MUST NOT expect system cleanup.",
+                description: "Remove fully exited processes from tracking, or terminate all tracked process groups with SIGTERM followed by SIGKILL when needed. Only affects processes started by this tool; you MUST NOT expect system cleanup.",
                 args: {
                     killAll: tool.schema
                         .boolean()
@@ -490,15 +556,37 @@ Use background_process_read to see output, or background_process_kill to stop it
                 async execute(args) {
                     const removed = [];
                     const killed = [];
+                    const failed = [];
                     for (const [id, info] of processes) {
-                        if (info.exited) {
+                        if (isProcessTerminated(info)) {
                             processes.delete(id);
                             removed.push(id);
                         }
                         else if (args.killAll ?? false) {
-                            info.proc.kill(15); // SIGTERM
-                            killed.push(id);
-                            processes.delete(id);
+                            const term = signalProcessGroup(info, "SIGTERM");
+                            if (!term.ok) {
+                                failed.push(`${id} (SIGTERM failed)`);
+                                continue;
+                            }
+                            let exited = await waitForTrackedTermination(info, CLEANUP_TERM_WAIT_MS);
+                            let signal = "SIGTERM";
+                            if (!exited) {
+                                const force = signalProcessGroup(info, "SIGKILL");
+                                if (!force.ok) {
+                                    failed.push(`${id} (SIGKILL failed)`);
+                                    continue;
+                                }
+                                signal = "SIGKILL";
+                                exited = await waitForTrackedTermination(info, CLEANUP_KILL_WAIT_MS);
+                            }
+                            if (exited) {
+                                await waitForOutputDrain(info);
+                                killed.push(`${id} (${signal})`);
+                                processes.delete(id);
+                            }
+                            else {
+                                failed.push(`${id} (still running)`);
+                            }
                         }
                     }
                     const parts = [];
@@ -506,6 +594,8 @@ Use background_process_read to see output, or background_process_kill to stop it
                         parts.push(`Killed: ${killed.join(", ")}`);
                     if (removed.length)
                         parts.push(`Removed: ${removed.join(", ")}`);
+                    if (failed.length)
+                        parts.push(`Failed: ${failed.join(", ")}`);
                     if (parts.length === 0)
                         parts.push("No processes to clean up.");
                     return parts.join("\n");

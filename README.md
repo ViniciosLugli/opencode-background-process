@@ -6,6 +6,7 @@ This repository is a public GitHub fork of `fernandezbaptiste/opencode-backgroun
 
 - Updated the package to a Bun-based workflow and refreshed compatible dependencies.
 - Added `background_process_wait` to wait for finite background processes with a 5 minute default timeout, 10 minute maximum timeout, safe abort/timeout behavior, and status heartbeats.
+- Hardened termination so kill and cleanup target the launched process group, confirm shutdown before removing tracking, and escalate cleanup to SIGKILL when SIGTERM is not enough.
 - Refined the bundled background-process skill guidance for wait usage, timeout diagnosis, and tracked-process boundaries.
 
 An OpenCode plugin for managing background processes. Launch, monitor, and control long-running tasks like dev servers, watchers, and build processes.
@@ -89,7 +90,7 @@ Send input to a running process started by this tool.
 
 ### `background_process_kill`
 
-Kill a background process started by this tool.
+Terminate a background process started by this tool. Signals are sent to the launched process group, so child processes are targeted with the wrapper shell. The process is only removed from tracking after termination is confirmed.
 
 | Argument | Type    | Required | Description                                         |
 | -------- | ------- | -------- | --------------------------------------------------- |
@@ -97,13 +98,17 @@ Kill a background process started by this tool.
 | `signal` | enum    | no       | SIGTERM, SIGKILL, or SIGINT (default: SIGTERM)      |
 | `remove` | boolean | no       | Remove from tracking after killing (default: false) |
 
+If SIGTERM is sent and the process group is still running, the tool reports that state and keeps the process tracked. Use `signal: "SIGKILL"` for stubborn processes that do not stop gracefully.
+
 ### `background_process_cleanup`
 
-Remove exited processes or kill all tracked processes.
+Remove fully exited processes or terminate all tracked processes.
 
 | Argument  | Type    | Required | Description                                                      |
 | --------- | ------- | -------- | ---------------------------------------------------------------- |
 | `killAll` | boolean | no       | Kill all running processes (default: false, only removes exited) |
+
+With `killAll: true`, cleanup sends SIGTERM first, waits briefly, escalates to SIGKILL when needed, and only removes processes that are confirmed stopped.
 
 ## Usage Examples
 
@@ -127,7 +132,7 @@ Kill process 'bun-1'
 - Output is buffered (last 500 lines by default)
 - Auto-generated IDs use the command name (e.g., `bun-1`, `node-2`)
 - `background_process_wait` is for finite processes. For servers and watchers, use `background_process_read` to verify readiness and `background_process_kill` when finished.
-- This plugin does not walk or manage the host process tree. It only controls processes launched through `background_process_launch`.
+- This plugin starts each command in its own process group and controls that group. It does not walk or manage unrelated host processes.
 
 ## License
 

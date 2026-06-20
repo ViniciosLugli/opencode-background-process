@@ -20,6 +20,8 @@ description: |-
 - Use `background_process_cleanup` periodically to remove exited processes
 - Before launching, check `background_process_list` to avoid duplicates
 - Use `remove: true` when killing to clean up in one step
+- If SIGTERM does not stop a tracked process, retry with `signal: "SIGKILL"`
+- Use `background_process_cleanup` with `killAll: true` to stop every tracked process; it escalates from SIGTERM to SIGKILL when required
 
 ## Verify Startup
 
@@ -58,7 +60,8 @@ When a wait times out, aggregate the likely causes from recent output before act
 
 Only processes started by `background_process_launch` are tracked.
 
-- Do not assume this tool can walk the host process tree
+- The plugin starts each command in its own process group and signals that group
+- Do not assume this tool can walk unrelated host process trees
 - Do not use tracked IDs as system PIDs
 - For external port conflicts, inspect with shell tools first, then kill external PIDs explicitly
 
@@ -86,6 +89,8 @@ When running multiple processes, set custom `id` for clarity:
 | SIGTERM (default) | Normal shutdown - gives process time to cleanup |
 | SIGINT | Simulate Ctrl+C - some processes handle this differently |
 | SIGKILL | Process won't die with SIGTERM - force kill |
+
+`background_process_kill` only removes a process from tracking after confirmed termination. If the result says the process is still running, use SIGKILL or inspect output before retrying.
 
 </signals>
 
