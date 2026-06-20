@@ -9,6 +9,7 @@ interface ProcessInfo {
   exitPromise: Promise<number>
   outputPromise: Promise<void>
   output: string[]
+  outputState: OutputState
   maxOutputLines: number
   startedAt: Date
   cwd: string
@@ -17,6 +18,19 @@ interface ProcessInfo {
 }
 
 type KillSignal = "SIGTERM" | "SIGKILL" | "SIGINT"
+type WaitMode = "all" | "any"
+type OutputStreamName = "stdout" | "stderr"
+
+interface OutputStreamState {
+  pending: string
+  prefix: string
+  carriageReturn: boolean
+}
+
+interface OutputState {
+  stdout: OutputStreamState
+  stderr: OutputStreamState
+}
 
 const processes = new Map<string, ProcessInfo>()
 
@@ -30,6 +44,8 @@ const KILL_WAIT_MS = 2_000
 const CLEANUP_TERM_WAIT_MS = 2_000
 const CLEANUP_KILL_WAIT_MS = 2_000
 const OUTPUT_DRAIN_WAIT_MS = 1_000
+const WAIT_OBSERVER_POLL_MS = 250
+const ANSI_ESCAPE_PATTERN = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g
 
 let processCounter = 0
 
@@ -41,12 +57,15 @@ function generateId(command: string): string {
 function appendOutput(info: ProcessInfo, data: string) {
   const lines = data.split("\n")
   for (const line of lines) {
-    if (line.trim()) {
-      info.output.push(line)
-      if (info.output.length > info.maxOutputLines) {
-        info.output.shift()
-      }
-    }
+    pushOutputLine(info, line)
+  }
+}
+
+function pushOutputLine(info: ProcessInfo, line: string) {
+  if (!line.trim()) return
+  info.output.push(line)
+  if (info.output.length > info.maxOutputLines) {
+    info.output.shift()
   }
 }
 
@@ -84,10 +103,93 @@ function formatProcessSummary(info: ProcessInfo): string[] {
   ]
 }
 
+function formatObserverSummary(targets: ProcessInfo[]): string[] {
+  return targets.flatMap((info, index) => {
+    const prefix = targets.length > 1 ? `${index + 1}. ` : ""
+    const continuationPrefix = targets.length > 1 ? "   " : ""
+    return formatProcessSummary(info).map((line, lineIndex) => `${lineIndex === 0 ? prefix : continuationPrefix}${line}`)
+  })
+}
+
 function formatRecentOutput(info: ProcessInfo, lines: number): string {
-  const output = info.output.slice(-lines)
+  const output = getOutputSnapshot(info).slice(-lines)
   if (output.length === 0) return "No output captured."
   return output.join("\n")
+}
+
+function getOutputSnapshot(info: ProcessInfo): string[] {
+  const snapshot = [...info.output]
+  appendPendingSnapshotLine(snapshot, info.outputState.stdout)
+  appendPendingSnapshotLine(snapshot, info.outputState.stderr)
+  return snapshot
+}
+
+function clearOutput(info: ProcessInfo) {
+  info.output = []
+  info.outputState.stdout.pending = ""
+  info.outputState.stderr.pending = ""
+  info.outputState.stdout.carriageReturn = false
+  info.outputState.stderr.carriageReturn = false
+}
+
+function appendPendingSnapshotLine(snapshot: string[], state: OutputStreamState) {
+  if (!state.pending.trim()) return
+  snapshot.push(`${state.prefix}${state.pending}`)
+}
+
+function appendStreamOutput(info: ProcessInfo, streamName: OutputStreamName, data: string) {
+  const state = info.outputState[streamName]
+  const text = data.replace(ANSI_ESCAPE_PATTERN, "")
+
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i]
+
+    if (state.carriageReturn) {
+      state.carriageReturn = false
+      if (char === "\n") {
+        flushStreamOutput(info, streamName)
+        continue
+      }
+      if (char === "\r") {
+        state.carriageReturn = true
+        continue
+      }
+      state.pending = ""
+    }
+
+    if (char === "\r") {
+      state.carriageReturn = true
+      continue
+    }
+
+    if (char === "\n") {
+      flushStreamOutput(info, streamName)
+      continue
+    }
+
+    if (char === "\b") {
+      state.pending = state.pending.slice(0, -1)
+      continue
+    }
+
+    if (isIgnoredControlCharacter(char)) continue
+    state.pending += char
+  }
+}
+
+function flushStreamOutput(info: ProcessInfo, streamName: OutputStreamName) {
+  const state = info.outputState[streamName]
+  if (state.pending.trim()) {
+    pushOutputLine(info, `${state.prefix}${state.pending}`)
+  }
+  state.pending = ""
+  state.carriageReturn = false
+}
+
+function isIgnoredControlCharacter(char: string): boolean {
+  if (char === "\t") return false
+  const code = char.charCodeAt(0)
+  return code < 32 || code === 127
 }
 
 function updateWaitMetadata(
@@ -124,6 +226,31 @@ function normalizeOutputLines(lines: number | undefined, defaultLines = DEFAULT_
     throw new Error(`lines must be between 1 and ${MAX_OUTPUT_LINES}.`)
   }
   return Math.round(value)
+}
+
+function normalizeWaitMode(mode: WaitMode | undefined): WaitMode {
+  return mode ?? "all"
+}
+
+function normalizeWaitTargets(id: string | undefined, ids: string[] | undefined): ProcessInfo[] {
+  const requested = [id, ...(ids ?? [])].filter((value): value is string => typeof value === "string" && value.length > 0)
+  const uniqueIds = Array.from(new Set(requested))
+
+  if (uniqueIds.length === 0) {
+    throw new Error("Provide id for one process or ids for multiple processes.")
+  }
+
+  const missing = uniqueIds.filter((processId) => !processes.has(processId))
+  if (missing.length > 0) {
+    const available = Array.from(processes.keys())
+    throw new Error(
+      `No process found with ID${missing.length === 1 ? "" : "s"} "${missing.join(", ")}". Available processes: ${
+        available.length ? available.join(", ") : "none"
+      }`,
+    )
+  }
+
+  return uniqueIds.map((processId) => processes.get(processId)!)
 }
 
 function signalToNumber(signal: KillSignal): number {
@@ -173,6 +300,10 @@ async function waitForOutputDrain(info: ProcessInfo): Promise<void> {
   await Promise.race([info.outputPromise, Bun.sleep(OUTPUT_DRAIN_WAIT_MS)])
 }
 
+async function waitForOutputDrains(infos: ProcessInfo[]) {
+  await Promise.all(infos.map((info) => waitForOutputDrain(info)))
+}
+
 function formatProcessList(): string {
   if (processes.size === 0) {
     return "No background processes running."
@@ -190,91 +321,124 @@ function formatProcessList(): string {
   return lines.join("\n")
 }
 
-async function streamToOutput(stream: ReadableStream<Uint8Array> | null, info: ProcessInfo, prefix = "") {
+async function streamToOutput(stream: ReadableStream<Uint8Array> | null, info: ProcessInfo, streamName: OutputStreamName) {
   if (!stream) return
   const reader = stream.getReader()
   const decoder = new TextDecoder()
   try {
     while (true) {
       const { done, value } = await reader.read()
-      if (done) break
+      if (done) {
+        appendStreamOutput(info, streamName, decoder.decode())
+        flushStreamOutput(info, streamName)
+        break
+      }
       const text = decoder.decode(value, { stream: true })
-      appendOutput(info, prefix ? `${prefix}${text}` : text)
+      appendStreamOutput(info, streamName, text)
     }
   } catch {
     // Stream closed
+  } finally {
+    flushStreamOutput(info, streamName)
   }
 }
 
-function waitForNextEvent(
-  info: ProcessInfo,
-  seconds: number,
-  abort: AbortSignal,
-): Promise<number | "heartbeat" | "aborted"> {
-  if (isProcessTerminated(info)) return Promise.resolve(info.exitCode ?? 0)
-  if (abort.aborted) return Promise.resolve("aborted")
-
-  return new Promise((resolve) => {
-    let settled = false
-    let timeout: ReturnType<typeof setTimeout>
-    function settle(value: number | "heartbeat" | "aborted") {
-      if (settled) return
-      settled = true
-      clearTimeout(timeout)
-      abort.removeEventListener("abort", onAbort)
-      resolve(value)
-    }
-    const onAbort = () => settle("aborted")
-
-    const waitSeconds = info.exited ? Math.min(seconds, 1) : seconds
-    timeout = setTimeout(() => settle("heartbeat"), waitSeconds * 1000)
-    abort.addEventListener("abort", onAbort, { once: true })
-    if (!info.exited) info.exitPromise.then((code) => settle(code))
-  })
+function getCompletedTargets(targets: ProcessInfo[]): ProcessInfo[] {
+  return targets.filter(isProcessTerminated)
 }
 
-async function waitForProcessExit(
-  info: ProcessInfo,
+function shouldFinishObserver(targets: ProcessInfo[], completed: ProcessInfo[], mode: WaitMode): boolean {
+  if (mode === "any") return completed.length > 0
+  return completed.length === targets.length
+}
+
+function formatTargetIds(targets: ProcessInfo[]): string {
+  return targets.map((info) => info.id).join(", ")
+}
+
+function formatObserverHeartbeat(targets: ProcessInfo[], completed: ProcessInfo[], remainingSeconds: number): string {
+  const pending = targets.filter((info) => !completed.includes(info))
+  return `[wait] Process observer still waiting after ${formatDuration(
+    Math.max(...targets.map(getRuntimeSeconds)),
+  )}. Completed ${completed.length}/${targets.length}. Pending: ${formatTargetIds(pending)}. Timeout in ${formatDuration(
+    remainingSeconds,
+  )}.`
+}
+
+function appendHeartbeatToPendingTargets(targets: ProcessInfo[], completed: ProcessInfo[], heartbeat: string) {
+  for (const info of targets) {
+    if (!completed.includes(info)) appendOutput(info, heartbeat)
+  }
+}
+
+function compactLines(lines: string[]): string {
+  return lines.filter((line, index, array) => line !== "" || array[index - 1] !== "").join("\n")
+}
+
+function formatWaitResponse(
+  intro: string,
+  mode: WaitMode,
+  completedIds: string[],
+  pendingIds: string[],
+  summary: string[],
+  heartbeatLines: string[],
+  recentOutputBlocks: string[],
+): string {
+  return compactLines([
+    intro,
+    `Mode: ${mode}`,
+    `Completed: ${completedIds.length ? completedIds.join(", ") : "none"}`,
+    `Pending: ${pendingIds.length ? pendingIds.join(", ") : "none"}`,
+    "",
+    ...summary,
+    "",
+    "Heartbeats:",
+    ...heartbeatLines,
+    "",
+    ...recentOutputBlocks,
+  ])
+}
+
+async function waitForObservedProcesses(
+  targets: ProcessInfo[],
+  mode: WaitMode,
   timeoutSeconds: number,
   abort: AbortSignal,
-  onHeartbeat: (heartbeat: string, remainingSeconds: number) => void,
-): Promise<{ result: "exited" | "timeout" | "aborted"; heartbeats: string[] }> {
+  onHeartbeat: (heartbeat: string, remainingSeconds: number, completed: ProcessInfo[]) => void,
+): Promise<{ result: "completed" | "timeout" | "aborted"; completed: ProcessInfo[]; heartbeats: string[] }> {
   const startedAt = Date.now()
   const deadline = startedAt + timeoutSeconds * 1000
   const heartbeats: string[] = []
   let nextHeartbeatAt = startedAt + HEARTBEAT_INTERVAL_SECONDS * 1000
 
-  while (!isProcessTerminated(info)) {
-    const now = Date.now()
-    const secondsUntilTimeout = Math.max(0, Math.ceil((deadline - now) / 1000))
-    if (secondsUntilTimeout === 0) return { result: "timeout", heartbeats }
-
-    const secondsUntilHeartbeat = Math.max(1, Math.ceil((nextHeartbeatAt - now) / 1000))
-    const waitSeconds = Math.min(secondsUntilTimeout, secondsUntilHeartbeat)
-
-    const result = await waitForNextEvent(info, waitSeconds, abort)
-
-    if (typeof result === "number") {
-      if (isProcessTerminated(info)) {
-        await waitForOutputDrain(info)
-        return { result: "exited", heartbeats }
-      }
-      continue
+  while (true) {
+    const completed = getCompletedTargets(targets)
+    if (shouldFinishObserver(targets, completed, mode)) {
+      await waitForOutputDrains(completed)
+      return { result: "completed", completed, heartbeats }
     }
-    if (result === "aborted") return { result: "aborted", heartbeats }
 
-    if (Date.now() >= nextHeartbeatAt && !isProcessTerminated(info)) {
-      const remainingSeconds = Math.max(0, Math.ceil((deadline - Date.now()) / 1000))
-      const heartbeat = `[wait] Process "${info.id}" still running after ${formatDuration(getRuntimeSeconds(info))}. Timeout in ${formatDuration(remainingSeconds)}.`
+    if (abort.aborted) return { result: "aborted", completed, heartbeats }
+
+    const now = Date.now()
+    const remainingMs = deadline - now
+    if (remainingMs <= 0) return { result: "timeout", completed, heartbeats }
+
+    if (now >= nextHeartbeatAt) {
+      const remainingSeconds = Math.max(0, Math.ceil(remainingMs / 1000))
+      const heartbeat = formatObserverHeartbeat(targets, completed, remainingSeconds)
       heartbeats.push(heartbeat)
-      appendOutput(info, heartbeat)
-      onHeartbeat(heartbeat, remainingSeconds)
+      appendHeartbeatToPendingTargets(targets, completed, heartbeat)
+      onHeartbeat(heartbeat, remainingSeconds, completed)
       nextHeartbeatAt += HEARTBEAT_INTERVAL_SECONDS * 1000
     }
-  }
 
-  await waitForOutputDrain(info)
-  return { result: "exited", heartbeats }
+    const waitMs = Math.min(WAIT_OBSERVER_POLL_MS, remainingMs, Math.max(1, nextHeartbeatAt - now))
+    await Promise.race([
+      Bun.sleep(waitMs),
+      ...targets.filter((info) => !info.exited).map((info) => info.exitPromise.then(() => undefined)),
+    ])
+  }
 }
 
 export const BackgroundProcessPlugin: Plugin = async ({ directory }) => {
@@ -342,6 +506,10 @@ export const BackgroundProcessPlugin: Plugin = async ({ directory }) => {
             exitPromise,
             outputPromise: Promise.resolve(),
             output: [],
+            outputState: {
+              stdout: { pending: "", prefix: "", carriageReturn: false },
+              stderr: { pending: "", prefix: "[stderr] ", carriageReturn: false },
+            },
             maxOutputLines,
             startedAt: new Date(),
             cwd,
@@ -350,8 +518,8 @@ export const BackgroundProcessPlugin: Plugin = async ({ directory }) => {
           }
 
           info.outputPromise = Promise.all([
-            streamToOutput(proc.stdout, info),
-            streamToOutput(proc.stderr, info, "[stderr] "),
+            streamToOutput(proc.stdout, info, "stdout"),
+            streamToOutput(proc.stderr, info, "stderr"),
           ]).then(() => undefined)
 
           processes.set(id, info)
@@ -360,8 +528,8 @@ export const BackgroundProcessPlugin: Plugin = async ({ directory }) => {
           await Bun.sleep(100)
 
           if (info.exited) {
-            await info.outputPromise
-            return `Process "${id}" started but exited immediately with code ${info.exitCode}.\nOutput:\n${info.output.join("\n")}`
+            await waitForOutputDrain(info)
+            return `Process "${id}" started but exited immediately with code ${info.exitCode}.\nOutput:\n${getOutputSnapshot(info).join("\n")}`
           }
 
           return `Background process started successfully.
@@ -413,10 +581,10 @@ Use background_process_read to see output, or background_process_kill to stop it
             return `Error: ${error instanceof Error ? error.message : String(error)}`
           }
 
-          const output = info.output.slice(-lines)
+          const output = getOutputSnapshot(info).slice(-lines)
 
           if (args.clear) {
-            info.output = []
+            clearOutput(info)
           }
 
           if (output.length === 0) {
@@ -430,9 +598,15 @@ Use background_process_read to see output, or background_process_kill to stop it
 
       background_process_wait: tool({
         description:
-          "Wait for a tracked background process to finish. Use for finite commands that were launched in the background. The wait is bounded, supports aborts, records heartbeat entries every 2 minutes while waiting, and never kills the process on timeout.",
+          "Wait for one or more tracked background processes to finish. Use id for a single process or ids for multiple processes. mode=all waits for every target; mode=any returns when the first target finishes. The wait is bounded, supports aborts, records heartbeat entries every 2 minutes while waiting, and never kills processes on timeout.",
         args: {
-          id: tool.schema.string().describe("The process ID to wait for"),
+          id: tool.schema.string().optional().describe("Single process ID to wait for"),
+          ids: tool.schema.array(tool.schema.string()).optional().describe("Process IDs to observe together"),
+          mode: tool.schema
+            .enum(["all", "any"])
+            .optional()
+            .default("all")
+            .describe("Wait mode for multiple processes: all or any (default: all)"),
           timeoutSeconds: tool.schema
             .number()
             .int()
@@ -451,93 +625,107 @@ Use background_process_read to see output, or background_process_kill to stop it
             .describe("Number of recent output lines to include in the result (default: 50)"),
         },
         async execute(args, context) {
-          const info = processes.get(args.id)
-          if (!info) {
-            const available = Array.from(processes.keys())
-            return `Error: No process found with ID "${args.id}". Available processes: ${available.length ? available.join(", ") : "none"}`
-          }
-
+          let targets: ProcessInfo[]
           let timeoutSeconds: number
           let lines: number
+          let mode: WaitMode
           try {
+            targets = normalizeWaitTargets(args.id, args.ids)
+            mode = normalizeWaitMode(args.mode)
             timeoutSeconds = normalizeWaitTimeout(args.timeoutSeconds)
             lines = normalizeOutputLines(args.lines)
           } catch (error) {
             return `Error: ${error instanceof Error ? error.message : String(error)}`
           }
 
-          updateWaitMetadata(context, info, `Waiting for ${info.id}`, {
+          const titleTarget = targets.length === 1 ? targets[0].id : `${targets.length} processes`
+          updateWaitMetadata(context, targets[0], `Waiting for ${titleTarget}`, {
+            ids: targets.map((info) => info.id),
+            mode,
             timeoutSeconds,
             remainingSeconds: timeoutSeconds,
             heartbeatIntervalSeconds: HEARTBEAT_INTERVAL_SECONDS,
           })
 
-          const wait = await waitForProcessExit(info, timeoutSeconds, context.abort, (heartbeat, remainingSeconds) => {
-            updateWaitMetadata(context, info, `Still waiting for ${info.id}`, {
-              heartbeat,
-              remainingSeconds,
-              timeoutSeconds,
-              heartbeatIntervalSeconds: HEARTBEAT_INTERVAL_SECONDS,
-            })
-          })
-          const summary = formatProcessSummary(info)
+          const wait = await waitForObservedProcesses(
+            targets,
+            mode,
+            timeoutSeconds,
+            context.abort,
+            (heartbeat, remainingSeconds, completed) => {
+              updateWaitMetadata(context, targets[0], `Still waiting for ${titleTarget}`, {
+                ids: targets.map((info) => info.id),
+                completedIds: completed.map((info) => info.id),
+                pendingIds: targets.filter((info) => !completed.includes(info)).map((info) => info.id),
+                mode,
+                heartbeat,
+                remainingSeconds,
+                timeoutSeconds,
+                heartbeatIntervalSeconds: HEARTBEAT_INTERVAL_SECONDS,
+              })
+            },
+          )
+
+          const completedIds = wait.completed.map((info) => info.id)
+          const pending = targets.filter((info) => !wait.completed.includes(info))
+          const pendingIds = pending.map((info) => info.id)
+          const summary = formatObserverSummary(targets)
           const heartbeatLines =
             wait.heartbeats.length > 0 ? wait.heartbeats.map((line) => `- ${line}`) : ["No heartbeat was needed."]
-          const output = formatRecentOutput(info, lines)
+          const recentOutputBlocks = targets.flatMap((info) => [
+            `Recent output for "${info.id}" (${lines} line limit):`,
+            formatRecentOutput(info, lines),
+            "",
+          ])
 
           if (wait.result === "timeout") {
-            updateWaitMetadata(context, info, `Wait timed out for ${info.id}`, {
+            updateWaitMetadata(context, targets[0], `Wait timed out for ${titleTarget}`, {
+              ids: targets.map((info) => info.id),
+              completedIds,
+              pendingIds,
+              mode,
               result: wait.result,
               timeoutSeconds,
             })
-            return [
-              `Timed out waiting for process "${info.id}" after ${formatDuration(timeoutSeconds)}. The process is still tracked and was not killed.`,
-              "",
-              ...summary,
-              "",
-              "Heartbeats:",
-              ...heartbeatLines,
-              "",
-              `Recent output (${lines} line limit):`,
-              output,
-            ].join("\n")
+            const intro =
+              targets.length === 1
+                ? `Timed out waiting for process "${targets[0].id}" after ${formatDuration(timeoutSeconds)}. The process is still tracked and was not killed.`
+                : `Timed out waiting for ${titleTarget} after ${formatDuration(timeoutSeconds)}. Processes are still tracked and were not killed.`
+            return formatWaitResponse(intro, mode, completedIds, pendingIds, summary, heartbeatLines, recentOutputBlocks)
           }
 
           if (wait.result === "aborted") {
-            updateWaitMetadata(context, info, `Wait aborted for ${info.id}`, {
+            updateWaitMetadata(context, targets[0], `Wait aborted for ${titleTarget}`, {
+              ids: targets.map((info) => info.id),
+              completedIds,
+              pendingIds,
+              mode,
               result: wait.result,
               timeoutSeconds,
             })
-            return [
-              `Stopped waiting for process "${info.id}" because the tool call was aborted. The process was not killed.`,
-              "",
-              ...summary,
-              "",
-              "Heartbeats:",
-              ...heartbeatLines,
-              "",
-              `Recent output (${lines} line limit):`,
-              output,
-            ].join("\n")
+            const intro =
+              targets.length === 1
+                ? `Stopped waiting for process "${targets[0].id}" because the tool call was aborted. The process was not killed.`
+                : `Stopped waiting for ${titleTarget} because the tool call was aborted. Processes were not killed.`
+            return formatWaitResponse(intro, mode, completedIds, pendingIds, summary, heartbeatLines, recentOutputBlocks)
           }
 
-          updateWaitMetadata(context, info, `Finished ${info.id}`, {
+          updateWaitMetadata(context, targets[0], `Finished waiting for ${titleTarget}`, {
+            ids: targets.map((info) => info.id),
+            completedIds,
+            pendingIds,
+            mode,
             result: wait.result,
-            exitCode: info.exitCode,
             timeoutSeconds,
           })
 
-          return [
-            `Process "${info.id}" finished.`,
-            "",
-            ...summary,
-            "",
-            "Heartbeats:",
-            ...heartbeatLines,
-            "",
-            `Recent output (${lines} line limit):`,
-            output,
-          ].join("\n")
+          const intro =
+            targets.length === 1
+              ? `Process "${targets[0].id}" finished.`
+              : mode === "any"
+                ? `At least one process finished: ${completedIds.join(", ")}.`
+                : `All processes finished: ${completedIds.join(", ")}.`
+          return formatWaitResponse(intro, mode, completedIds, pendingIds, summary, heartbeatLines, recentOutputBlocks)
         },
       }),
 

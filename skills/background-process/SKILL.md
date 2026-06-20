@@ -40,6 +40,9 @@ Use `background_process_wait` for commands that should eventually terminate, suc
 
 - Default timeout is 5 minutes
 - Maximum timeout is 10 minutes
+- Use `id` for one process or `ids` for multiple processes
+- Use `mode: "all"` to wait for every target to finish
+- Use `mode: "any"` to return when the first target finishes, then inspect completed/pending IDs or wait again
 - Timeout does not kill the process
 - Tool status metadata is updated every 2 minutes while waiting
 - Heartbeat entries are also recorded in process output and returned with the final result
@@ -98,6 +101,7 @@ When running multiple processes, set custom `id` for clarity:
 
 - Processes persist for the session - they don't auto-cleanup on conversation end
 - Output buffer is limited (500 lines default) - increase `maxOutputLines` for verbose builds
+- Progress bars that redraw in place are normalized for text reads
 - stderr is prefixed with `[stderr]` in output - helps distinguish errors
 
 </gotchas>

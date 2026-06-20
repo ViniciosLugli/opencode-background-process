@@ -5,8 +5,9 @@ This repository is a public GitHub fork of `fernandezbaptiste/opencode-backgroun
 ## Fork Changes
 
 - Updated the package to a Bun-based workflow and refreshed compatible dependencies.
-- Added `background_process_wait` to wait for finite background processes with a 5 minute default timeout, 10 minute maximum timeout, safe abort/timeout behavior, and status heartbeats.
+- Added `background_process_wait` to wait for one or more finite background processes with a 5 minute default timeout, 10 minute maximum timeout, safe abort/timeout behavior, selectable `all`/`any` modes, and status heartbeats.
 - Hardened termination so kill and cleanup target the launched process group, confirm shutdown before removing tracking, and escalate cleanup to SIGKILL when SIGTERM is not enough.
+- Normalized terminal-style progress output so carriage-return progress bars remain readable in text output.
 - Refined the bundled background-process skill guidance for wait usage, timeout diagnosis, and tracked-process boundaries.
 
 An OpenCode plugin for managing background processes. Launch, monitor, and control long-running tasks like dev servers, watchers, and build processes.
@@ -68,15 +69,19 @@ Read captured output from a background process started by this tool.
 
 ### `background_process_wait`
 
-Wait for a tracked background process to terminate. Use for finite commands that were launched in the background.
+Wait for one or more tracked background processes to terminate. Use for finite commands that were launched in the background.
 
 | Argument         | Type   | Required | Description                                           |
 | ---------------- | ------ | -------- | ----------------------------------------------------- |
-| `id`             | string | yes      | Process ID to wait for                                |
+| `id`             | string | no       | Single process ID to wait for                         |
+| `ids`            | array  | no       | Process IDs to observe together                       |
+| `mode`           | enum   | no       | `all` or `any` (default: `all`)                       |
 | `timeoutSeconds` | number | no       | Maximum seconds to wait, 1-600 (default: 300)         |
 | `lines`          | number | no       | Recent output lines to include in result (default: 50) |
 
-The wait operation publishes tool metadata updates every 2 minutes, records heartbeat entries in the process output buffer, and returns those heartbeats in the final result. A timeout does not kill the process; it remains tracked and can be read, waited on again, or killed explicitly.
+Provide either `id` for the existing single-process behavior or `ids` for multi-process observation. `mode: "all"` waits until every target finishes. `mode: "any"` returns when at least one target finishes and reports which targets are still pending, so the caller can continue or wait again. A timeout does not kill processes; they remain tracked and can be read, waited on again, or killed explicitly.
+
+The wait operation publishes tool metadata updates every 2 minutes, records heartbeat entries on pending process output buffers, and returns those heartbeats in the final result.
 
 ### `background_process_write`
 
@@ -121,6 +126,10 @@ Read the last 100 lines from process 'bun-1'
 
 Wait for process 'bun-1' to finish, with a 5 minute default timeout
 
+Wait for all processes ['build', 'test'] to finish
+
+Wait until any process in ['server-a', 'server-b'] finishes
+
 Send 'q' to process 'bun-1' to quit
 
 Kill process 'bun-1'
@@ -130,6 +139,7 @@ Kill process 'bun-1'
 
 - Processes are tracked per OpenCode session and only include those started by this tool
 - Output is buffered (last 500 lines by default)
+- Terminal-style progress output is normalized for text reads; carriage-return redraws show the latest logical line instead of every redraw.
 - Auto-generated IDs use the command name (e.g., `bun-1`, `node-2`)
 - `background_process_wait` is for finite processes. For servers and watchers, use `background_process_read` to verify readiness and `background_process_kill` when finished.
 - This plugin starts each command in its own process group and controls that group. It does not walk or manage unrelated host processes.
