@@ -1,8 +1,9 @@
 {
-  "name": "@howaboua/opencode-background-process",
-  "version": "0.1.1",
+  "name": "@vinicioslugli/opencode-background-process",
+  "version": "0.2.0",
   "type": "module",
-  "description": "OpenCode plugin for managing background processes - launch, monitor, and control long-running tasks",
+  "packageManager": "bun@1.3.14",
+  "description": "OpenCode plugin for managing background processes - launch, wait for, monitor, and control long-running tasks",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "files": [
@@ -20,22 +21,31 @@
     "dev-server"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ViniciosLugli/opencode-background-process.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ViniciosLugli/opencode-background-process/issues"
+  },
+  "homepage": "https://github.com/ViniciosLugli/opencode-background-process#readme",
   "publishConfig": {
     "access": "public"
   },
   "peerDependencies": {
-    "@opencode-ai/plugin": "^1.0.0"
+    "@opencode-ai/plugin": "^1.17.8"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "^1.0.0",
-    "@types/bun": "^1.2.0",
-    "@types/node": "^22.0.0",
-    "typescript": "^5.7.0"
+    "@opencode-ai/plugin": "^1.17.8",
+    "@types/bun": "^1.3.14",
+    "@types/node": "^22.19.21",
+    "typescript": "^5.9.3"
   },
   "scripts": {
     "clean": "rm -rf dist",
-    "build": "npm run clean && tsc && cp -r skills dist/",
+    "build": "bun run clean && bunx tsc && cp -r skills dist/",
     "dev": "opencode plugin dev",
-    "prepublishOnly": "npm run build"
+    "typecheck": "bunx tsc --noEmit",
+    "prepublishOnly": "bun run build"
   }
 }

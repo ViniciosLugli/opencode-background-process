@@ -22,18 +22,17 @@ type Config = Parameters<NonNullable<Hooks["config"]>>[0] & SkillsConfig
 const resolveBundledSkillPaths = async () => {
   const baseDir = path.dirname(fileURLToPath(import.meta.url))
   const candidates = [baseDir, path.join(baseDir, "..", "..", "skills")]
-  const resolved: string[] = []
 
   for (const candidate of candidates) {
     try {
-      await access(candidate)
-      resolved.push(candidate)
+      await access(path.join(candidate, "background-process", "SKILL.md"))
+      return [candidate]
     } catch {
       // Ignore missing paths
     }
   }
 
-  return resolved
+  return []
 }
 
 const registerSkillPaths = (config: Config, paths: string[]) => {

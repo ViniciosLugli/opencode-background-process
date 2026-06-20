@@ -1,8 +1,8 @@
 <instructions>
 ## Build & Verification
-- Use `npm run build` for one-shot compilation and skill sync.
-- Use `npx tsc --noEmit` for fast type-checking without output.
-- MUST NOT run `npm run dev` or any long-running/blocking processes.
+- Use `bun run build` for one-shot compilation and skill sync.
+- Use `bun run typecheck` for fast type-checking without output.
+- MUST NOT run `bun run dev` or any long-running/blocking processes.
 - Verification MUST be performed using one-shot commands before finishing tasks.
 
 ## Task Routing
@@ -12,7 +12,8 @@
 - Configuration: `example-opencode.json` provides reference for plugin integration.
 
 ## Repository Constraints
-- `package-lock.json` and `node_modules/` are READ-ONLY.
+- `node_modules/` is READ-ONLY.
+- `bun.lock` is the package lockfile.
 - `dist/` is READ-ONLY; it is overwritten on every build.
 - `LICENSE` is READ-ONLY.
 - Coding: MUST use ESM (Module) syntax per `package.json`.
@@ -20,7 +21,7 @@
 </instructions>
 
 <rules>
-- You MUST run `npm run build` after modifying files in `src/` or `skills/`.
+- You MUST run `bun run build` after modifying files in `src/` or `skills/`.
 - You MUST NOT use interactive `git` commands (e.g., `rebase -i`).
 - You MUST handle process lifecycle (spawn, kill, signals) explicitly in `src/`.
 - You SHOULD use `example-opencode.json` as a blueprint for new plugin features.
