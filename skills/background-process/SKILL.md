@@ -63,7 +63,8 @@ When a wait times out, aggregate the likely causes from recent output before act
 
 Only processes started by `background_process_launch` are tracked.
 
-- The plugin starts each command in its own process group and signals that group
+- The plugin starts each command in its own process group and signals the whole descendant tree (leader + children + detached setsid/daemon descendants)
+- On Linux the kill path enumerates `/proc` to reach children that escaped into their own session/process group, so API services that call `setsid` are still terminated
 - Do not assume this tool can walk unrelated host process trees
 - Do not use tracked IDs as system PIDs
 - For external port conflicts, inspect with shell tools first, then kill external PIDs explicitly
@@ -95,6 +96,8 @@ When running multiple processes, set custom `id` for clarity:
 
 `background_process_kill` only removes a process from tracking after confirmed termination. If the result says the process is still running, use SIGKILL or inspect output before retrying.
 
+Signals are delivered to every PID in the launched process's descendant tree, not just the process group. This catches daemons that detach into their own session, and bypasses whole-group EPERM failures on Linux by signaling each PID individually.
+
 </signals>
 
 <gotchas>
@@ -103,5 +106,6 @@ When running multiple processes, set custom `id` for clarity:
 - Output buffer is limited (500 lines default) - increase `maxOutputLines` for verbose builds
 - Progress bars that redraw in place are normalized for text reads
 - stderr is prefixed with `[stderr]` in output - helps distinguish errors
+- Descendants that drop privileges (UID change) may be un-signalable due to Linux permission rules; the kill path skips those PIDs rather than aborting the whole sweep
 
 </gotchas>

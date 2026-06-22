@@ -1,4 +1,5 @@
 import { type Hooks, type Plugin, type ToolContext, tool } from "@opencode-ai/plugin"
+import { readdirSync, readFileSync } from "node:fs"
 
 import { createBundledSkillsHook } from "./skills"
 
@@ -15,6 +16,7 @@ interface ProcessInfo {
   cwd: string
   exited: boolean
   exitCode: number | null
+  treeSnapshot: number[] | null
 }
 
 type KillSignal = "SIGTERM" | "SIGKILL" | "SIGINT"
@@ -46,6 +48,7 @@ const CLEANUP_KILL_WAIT_MS = 2_000
 const OUTPUT_DRAIN_WAIT_MS = 1_000
 const WAIT_OBSERVER_POLL_MS = 250
 const ANSI_ESCAPE_PATTERN = /\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])/g
+const PROC_POLL_INTERVAL_MS = 50
 
 let processCounter = 0
 
@@ -259,26 +262,179 @@ function signalToNumber(signal: KillSignal): number {
   return 15
 }
 
-function signalProcessGroup(info: ProcessInfo, signal: KillSignal): { ok: true } | { ok: false; error: unknown } {
+function isLinux(): boolean {
+  return process.platform === "linux"
+}
+
+function isErrnoException(value: unknown, code?: string): value is NodeJS.ErrnoException {
+  return (
+    value instanceof Error &&
+    typeof (value as NodeJS.ErrnoException).code === "string" &&
+    (code === undefined || (value as NodeJS.ErrnoException).code === code)
+  )
+}
+
+interface ProcStat {
+  pid: number
+  ppid: number
+  pgrp: number
+}
+
+function readProcStat(pid: number): ProcStat | null {
   try {
-    process.kill(-info.proc.pid, signal)
-    return { ok: true }
-  } catch (groupError) {
-    try {
-      info.proc.kill(signalToNumber(signal))
-      return { ok: true }
-    } catch (processError) {
-      return { ok: false, error: processError instanceof Error ? processError : groupError }
-    }
+    const raw = readFileSync(`/proc/${pid}/stat`, "utf8")
+    const afterComm = raw.slice(raw.lastIndexOf(")") + 2)
+    const fields = afterComm.trim().split(/\s+/)
+    const state = fields[0]
+    if (state === "Z") return null
+    const ppid = Number(fields[1])
+    const pgrp = Number(fields[2])
+    if (!Number.isFinite(ppid) || !Number.isFinite(pgrp)) return null
+    return { pid, ppid, pgrp }
+  } catch {
+    return null
   }
 }
 
-function isProcessGroupAlive(info: ProcessInfo): boolean {
+function enumerateProcessTree(rootPid: number): number[] {
+  if (!isLinux()) return [rootPid]
+  const root = readProcStat(rootPid)
+  if (!root) return [rootPid]
+
+  const all: Map<number, ProcStat> = new Map()
+  all.set(rootPid, root)
+
+  let procEntries: string[] = []
   try {
-    process.kill(-info.proc.pid, 0)
-    return true
+    procEntries = readdirSync("/proc")
+  } catch {
+    return [rootPid]
+  }
+
+  for (const entry of procEntries) {
+    if (!/^\d+$/.test(entry)) continue
+    const pid = Number(entry)
+    if (pid === rootPid) continue
+    const stat = readProcStat(pid)
+    if (!stat) continue
+    all.set(pid, stat)
+  }
+
+  const result = new Set<number>([rootPid])
+  const queue: number[] = [rootPid]
+  while (queue.length > 0) {
+    const current = queue.shift()!
+    for (const [pid, stat] of all) {
+      if (result.has(pid)) continue
+      const isChildOfCurrent = stat.ppid === current
+      const sharesRootGroup = stat.pgrp === rootPid && stat.pgrp !== stat.pid
+      if (isChildOfCurrent || sharesRootGroup) {
+        result.add(pid)
+        queue.push(pid)
+      }
+    }
+  }
+
+  return Array.from(result)
+}
+
+function signalOnePid(pid: number, signal: KillSignal): "ok" | "esrch" | "eperm" | "error" {
+  try {
+    process.kill(pid, signalToNumber(signal))
+    return "ok"
   } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ESRCH") return false
+    if (isErrnoException(error, "ESRCH")) return "esrch"
+    if (isErrnoException(error, "EPERM")) return "eperm"
+    return "error"
+  }
+}
+
+function signalProcessGroup(info: ProcessInfo, signal: KillSignal): { ok: true } | { ok: false; error: unknown } {
+  const leaderPid = info.proc.pid
+  if (typeof leaderPid !== "number" || !Number.isFinite(leaderPid)) {
+    return { ok: false, error: new Error("Process PID is not available.") }
+  }
+
+  // Snapshot the descendant tree BEFORE signaling. Once the leader dies, detached
+  // children (setsid daemons, privilege-dropping services) reparent to init and
+  // become unfindable via /proc PPID walks. Capturing up front avoids that race.
+  if (!info.treeSnapshot || info.treeSnapshot.length === 0) {
+    info.treeSnapshot = enumerateProcessTree(leaderPid)
+  }
+  const tree = info.treeSnapshot
+
+  let signaledAny = false
+  let lastError: unknown
+
+  // Fast path: signal the whole process group in one syscall. This reaches every
+  // member that shares the leader's PGID. Detached descendants (different PGID)
+  // are caught by the per-PID pass below.
+  try {
+    process.kill(-leaderPid, signal)
+    signaledAny = true
+  } catch (groupError) {
+    if (isErrnoException(groupError, "ESRCH")) {
+      // Leader's group is already empty; per-PID pass below handles survivors.
+    } else {
+      // EPERM or other: whole-group failed (e.g. a member we can't signal).
+      // Fall through to per-PID delivery so signalable members still get hit.
+      lastError = groupError
+    }
+  }
+
+  // Per-PID pass: reaches descendants that left the leader's process group
+  // (setsid/daemon services) and bypasses atomic EPERM on whole-group kills.
+  for (const pid of tree) {
+    const result = signalOnePid(pid, signal)
+    if (result === "ok") signaledAny = true
+    else if (result !== "esrch" && result !== "eperm") lastError = new Error(`signal ${signal} to ${pid}: ${result}`)
+  }
+
+  if (signaledAny) return { ok: true }
+  if (lastError) return { ok: false, error: lastError }
+  // Everything in the tree was already dead (ESRCH) — treat as success.
+  return { ok: true }
+}
+
+function isProcessGroupAlive(info: ProcessInfo): boolean {
+  const leaderPid = info.proc.pid
+  if (typeof leaderPid !== "number" || !Number.isFinite(leaderPid)) return false
+
+  try {
+    process.kill(-leaderPid, 0)
+    return true
+  } catch (groupError) {
+    if (isErrnoException(groupError, "ESRCH")) {
+      // Leader's own process group is empty, but detached descendants (setsid
+      // daemons) may still be alive in other groups. Check the cached snapshot
+      // captured at signal time, since /proc PPID walks fail after reparenting.
+      const tree = info.treeSnapshot ?? enumerateProcessTree(leaderPid)
+      for (const pid of tree) {
+        try {
+          process.kill(pid, 0)
+          return true
+        } catch (pidError) {
+          if (isErrnoException(pidError, "ESRCH")) continue
+          if (isErrnoException(pidError, "EPERM")) return true
+          return true
+        }
+      }
+      return false
+    }
+    if (isErrnoException(groupError, "EPERM")) {
+      const tree = info.treeSnapshot ?? enumerateProcessTree(leaderPid)
+      for (const pid of tree) {
+        try {
+          process.kill(pid, 0)
+          return true
+        } catch (pidError) {
+          if (isErrnoException(pidError, "ESRCH")) continue
+          if (isErrnoException(pidError, "EPERM")) return true
+          return true
+        }
+      }
+      return false
+    }
     return true
   }
 }
@@ -291,7 +447,7 @@ async function waitForTrackedTermination(info: ProcessInfo, timeoutMs: number): 
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     if (isProcessTerminated(info)) return true
-    await Bun.sleep(50)
+    await Bun.sleep(PROC_POLL_INTERVAL_MS)
   }
   return isProcessTerminated(info)
 }
@@ -515,6 +671,7 @@ export const BackgroundProcessPlugin: Plugin = async ({ directory }) => {
             cwd,
             exited: false,
             exitCode: null,
+            treeSnapshot: null,
           }
 
           info.outputPromise = Promise.all([
